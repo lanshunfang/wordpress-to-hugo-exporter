@@ -27,6 +27,21 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 class Hugo_Export
 {
     protected $_tempDir = null;
+
+    // generated post descriptor file
+    protected $post_descriptor_yaml = 'post-descriptor.yaml';
+
+    // disable zipping when you don't want to transfer exported zip files
+    protected $zip_disabled = true;
+
+    // if only process changes on updated / added / deleted posts (delta processing)
+    // for sake of processing speed, we could assign this to true
+    // you must set zip_disabled to true if you want to use this feature
+    protected $only_process_changes = true;
+
+    protected $last_post_descriptor = array();
+    protected $post_descriptor = array();
+    
     private $zip_folder = 'hugo-export/'; //folder zip file extracts to
     private $post_folder = 'posts/'; //folder to place posts within
 
@@ -104,14 +119,20 @@ class Hugo_Export
 
     /**
      * @param WP_Post $post
+     * @param bool $isUpdatedDate - Is get updated date
      *
      * @return bool|string
      */
-    protected function _getPostDateAsIso(WP_Post $post)
+    protected function _getPostDateAsIso(WP_Post $post, $isUpdatedDate)
     {
         // Dates in the m/d/y or d-m-y formats are disambiguated by looking at the separator between the various components: if the separator is a slash (/),
         // then the American m/d/y is assumed; whereas if the separator is a dash (-) or a dot (.), then the European d-m-y format is assumed.
-        $unixTime = strtotime($post->post_date_gmt);
+        if ($isUpdatedDate) {
+            $unixTime = strtotime($post->post_modified_gmt);
+        } else {
+            $unixTime = strtotime($post->post_date_gmt);
+        }
+        
         return date('c', $unixTime);
     }
 
@@ -125,6 +146,7 @@ class Hugo_Export
             'author' => get_userdata($post->post_author)->display_name,
             'type' => get_post_type($post),
             'date' => $this->_getPostDateAsIso($post),
+            'lastmod' => $this->_getPostDateAsIso($post, true),
         );
         if (false === empty($post->post_excerpt)) {
             $output['excerpt'] = $post->post_excerpt;
@@ -259,11 +281,55 @@ class Hugo_Export
     }
 
     /**
+     * Get all post metadata of name / created-date / updated-date, etc
+     * 
+     * @description
+     * 
+     * Get post metadata for delta (diff) processing.
+     * 
+     * - For meta website, you may not want to get all posts everytime which is pretty slow.
+     * - This will generate a descriptor for comparing with last time's operations
+     * 
+     * 
+     */ 
+    function set_post_descriptor($postDescriptorMeta) {
+        $this->post_descriptor = $postDescriptorMeta;
+    }
+
+    /** 
+     * Load yaml file saved last time to variable $this->last_post_descriptor
+    */
+    function load_yaml_to_last_post_descriptor() {
+        $fileFullPath = $this->get_post_descriptor_full_path();
+        if (file_exists($fileFullPath)) {
+            $this->last_post_descriptor = yaml_parse_file($this->get_post_descriptor_full_path());
+        }
+
+    }
+
+    function save_post_descriptor() {  
+        $this->write(yaml_emit($this->post_descriptor), $this->post_descriptor_yaml, 'plain');
+    }
+
+    function get_post_descriptor_full_path() {
+        return $this->dir . $this->post_descriptor_yaml;
+    }
+    
+    function is_file_metadata_changed($fileId){
+        return $this->post_descriptor[$fileId] !== $this->last_post_descriptor[$fileId];
+    }
+
+    /**
      * Loop through and convert all posts to MD files with YAML headers
+     * 
+     * @param bool $isGenerateMetaData - If just generate Page metadata
+     * useful to decide if skip unchanges posts for mega website (delta processing)
      */
-    function convert_posts()
+    function convert_posts($isGenerateMetaData)
     {
         global $post;
+
+        $postDescriptorMeta = array();
 
         foreach ($this->get_posts() as $postID) {
             $post = get_post($postID);
@@ -276,6 +342,15 @@ class Hugo_Export
                 }
             }
 
+            if ($isGenerateMetaData) {
+                array_push($postDescriptorMeta, array('post_id_' . $postID => implode($meta)));
+                contine;
+            }
+
+            if ($this->only_process_changes && !$this->is_file_metadata_changed($postID)) {
+                contine;
+            }
+
             // Hugo doesn't like word-wrapped permalinks
             $output = Spyc::YAMLDump($meta, false, 0);
 
@@ -286,6 +361,11 @@ class Hugo_Export
             }
             $this->write($output, $post);
         }
+
+        if ($isGenerateMetaData) {
+            $this->set_post_descriptor($postDescriptorMeta);
+        }
+        
     }
 
     function filesystem_method_filter()
@@ -323,8 +403,9 @@ class Hugo_Export
 
         WP_Filesystem();
 
-        $this->dir = $this->getTempDir() . 'wp-hugo-' . md5(time()) . '/';
-        $this->zip = $this->getTempDir() . 'wp-hugo.zip';
+        $this->prepare_variables();
+        $this->set_exported_folder();
+
         $wp_filesystem->mkdir($this->dir);
         $wp_filesystem->mkdir($this->dir . $this->post_folder);
         $wp_filesystem->mkdir($this->dir . 'wp-content/');
@@ -332,9 +413,48 @@ class Hugo_Export
         $this->convert_options();
         $this->convert_posts();
         $this->convert_uploads();
-        $this->zip();
-        $this->send();
-        $this->cleanup();
+
+        if ( !$this->zip_disabled ){
+            $this->zip();
+            $this->send();
+            $this->cleanup();
+        }
+
+        if ($this->zip_disabled) {
+            echo "[INFO] Exported, check it out your tmp folder $this->dir";
+        }
+
+        if ($this->only_process_changes) {
+            $this->save_post_descriptor();
+        }
+        
+    }
+    
+    /** 
+     * Prepare variables before export
+    */
+    function prepare_variables() {
+        if ($this->only_process_changes && ! $this->zip_disabled) {
+            echo "[WARN] only_process_changes toggle only works when zip_disabled is set to true";
+            $this->only_process_changes = false;
+        }
+
+        if ($this->only_process_changes) {
+            $this->load_yaml_to_last_post_descriptor();
+            $this->convert_posts(true);
+        }
+        
+    }
+
+    function set_exported_folder() {
+        $tmpFolder = $this->getTempDir();
+        $filePrefix = 'wp-hugo';
+        $this->dir = $tmpFolder . $filePrefix . '-' . md5(time()) . '/';
+        $this->zip = $tmpFolder . $filePrefix . '.zip';
+
+        if ($this->only_process_changes) {
+            $this->dir = $tmpFolder . $filePrefix . '-delta-processing';
+        }
     }
 
     /**
@@ -379,21 +499,42 @@ class Hugo_Export
     }
 
     /**
-     * Write file to temp dir
+     * Write string buffer to file in temp dir
+     * 
+     * @param string $content - String to write to disk
+     * @param mixed $context - Dynamic Object for processing
+     *                          When is a $contextType is plain, it should be a file name 
+     *                          which to be write to $this->dir
+     * @param string $contextType - Describe $context. 
+     *                              Possible values: 
+     *                                  'post' - Wordpress Post Object; Defaulted if omitted
+     *                                  'plain' - Plain string
      */
-    function write($output, $post)
+    function write($content, $context, $contextType)
     {
 
         global $wp_filesystem;
 
-        if (get_post_type($post) == 'page') {
-            $wp_filesystem->mkdir(urldecode($this->dir . $post->post_name));
-            $filename = urldecode($post->post_name . '/index.md');
-        } else {
-            $filename = $this->post_folder . date('Y-m-d', strtotime($post->post_date)) . '-' . urldecode($post->post_name) . '.md';
+        $contextTypeEnum = array(
+            'POST' => 'post',
+            'PLAIN' => 'plain'
+        );
+
+        $isPost = empty($contextType) || $contextType === $contextTypeEnum['POST'];
+        $isPlainFile = $contextType === $contextTypeEnum['PLAIN'];
+
+        if ($isPost) {
+            if (get_post_type($post) == 'page') {
+                $wp_filesystem->mkdir(urldecode($this->dir . $post->post_name));
+                $filename = urldecode($post->post_name . '/index.md');
+            } else {
+                $filename = $this->post_folder . date('Y-m-d', strtotime($post->post_date)) . '-' . urldecode($post->post_name) . '.md';
+            }
+        } else if ($isPlainFile) {
+            $filename = $context;
         }
 
-        $wp_filesystem->put_contents($this->dir . $filename, $output);
+        $wp_filesystem->put_contents($this->dir . $filename, $content);
     }
 
     /**
