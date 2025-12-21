@@ -29,6 +29,11 @@ class Hugo_Export
     protected $_tempDir = null;
     private $zip_folder = 'hugo-export/'; //folder zip file extracts to
     private $post_folder = 'posts/'; //folder to place posts within
+    private $worker_processes = 2;
+    private $max_worker_processes = 8;
+    private $worker_batch_size = 100;
+    private $worker_cursor_file = '';
+    private $total_post_count = 0;
 
     /**
      * Manually edit this private property and set it to TRUE if you want to export
@@ -97,9 +102,31 @@ class Hugo_Export
      */
     function get_posts()
     {
-
         global $wpdb;
-        return $wpdb->get_col("SELECT ID FROM $wpdb->posts WHERE post_status in ('future', 'publish', 'draft', 'private') AND post_type IN ('post', 'page' )");
+        $whereClause = $this->build_posts_where_clause();
+        return $wpdb->get_col("SELECT ID FROM $wpdb->posts WHERE {$whereClause} ORDER BY ID ASC");
+    }
+
+    protected function build_posts_where_clause()
+    {
+        return "post_status in ('future', 'publish', 'draft', 'private') AND post_type IN ('post', 'page' )";
+    }
+
+    protected function count_posts()
+    {
+        global $wpdb;
+        $whereClause = $this->build_posts_where_clause();
+        return (int)$wpdb->get_var("SELECT COUNT(1) FROM $wpdb->posts WHERE {$whereClause}");
+    }
+
+    protected function get_posts_batch($offset, $limit)
+    {
+        global $wpdb;
+        $offset = max(0, (int)$offset);
+        $limit = max(1, (int)$limit);
+        $whereClause = $this->build_posts_where_clause();
+        $sql = $wpdb->prepare("SELECT ID FROM $wpdb->posts WHERE {$whereClause} ORDER BY ID ASC LIMIT %d OFFSET %d", $limit, $offset);
+        return $wpdb->get_col($sql);
     }
 
     /**
@@ -263,22 +290,100 @@ class Hugo_Export
      */
     function convert_posts()
     {
+        $this->total_post_count = $this->count_posts();
+        if ($this->total_post_count === 0) {
+            return;
+        }
+
+        $workerCount = max(1, min($this->worker_processes, $this->max_worker_processes));
+        $pcntlAvailable = function_exists('pcntl_fork') && function_exists('pcntl_waitpid');
+
+        if (!$pcntlAvailable || $workerCount === 1) {
+            if ($workerCount > 1 && !$pcntlAvailable) {
+                echo "[WARN] pcntl extension is unavailable; running export sequentially";
+            }
+            $this->process_batches_sequentially();
+            return;
+        }
+
+        $this->init_worker_cursor();
+
+        $children = array();
+        $childProcesses = max(0, $workerCount - 1);
+        for ($i = 0; $i < $childProcesses; $i++) {
+            $pid = pcntl_fork();
+            if ($pid == -1) {
+                echo "[WARN] Unable to fork worker process; continuing with available processes";
+                break;
+            }
+
+            if ($pid === 0) {
+                $this->worker_process_loop();
+                if (function_exists('wp_reset_postdata')) {
+                    wp_reset_postdata();
+                }
+                exit(0);
+            }
+
+            $children[$pid] = true;
+        }
+
+        // parent participates as a worker as well
+        $this->worker_process_loop();
+        $this->wait_for_worker($children, true);
+        $this->destroy_worker_cursor();
+
+        if (function_exists('wp_reset_postdata')) {
+            wp_reset_postdata();
+        }
+    }
+
+    protected function process_batches_sequentially()
+    {
+        $cursor = 0;
+        while (true) {
+            $batch = $this->get_posts_batch($cursor, $this->worker_batch_size);
+            if (empty($batch)) {
+                break;
+            }
+            $this->convert_post_batch($batch);
+            $cursor += $this->worker_batch_size;
+        }
+    }
+
+    protected function worker_process_loop()
+    {
+        while (true) {
+            $cursor = $this->claim_next_cursor();
+            if ($cursor === null) {
+                break;
+            }
+            $batch = $this->get_posts_batch($cursor, $this->worker_batch_size);
+            if (empty($batch)) {
+                break;
+            }
+            $this->convert_post_batch($batch);
+        }
+    }
+
+    protected function convert_post_batch(array $postIDs)
+    {
         global $post;
 
-        foreach ($this->get_posts() as $postID) {
+        foreach ($postIDs as $postID) {
             $post = get_post($postID);
+            if (!$post) {
+                continue;
+            }
             setup_postdata($post);
             $meta = array_merge($this->convert_meta($post), $this->convert_terms($postID));
-            // remove falsy values, which just add clutter
             foreach ($meta as $key => $value) {
                 if (!is_numeric($value) && !$value) {
                     unset($meta[$key]);
                 }
             }
 
-            // Hugo doesn't like word-wrapped permalinks
             $output = Spyc::YAMLDump($meta, false, 0);
-
             $output .= "\n---\n";
             $output .= $this->convert_content($post);
             if ($this->include_comments) {
@@ -286,6 +391,73 @@ class Hugo_Export
             }
             $this->write($output, $post);
         }
+    }
+
+    protected function wait_for_worker(array &$children, $waitAll)
+    {
+        if (empty($children)) {
+            return;
+        }
+
+        do {
+            $pid = pcntl_waitpid(-1, $status);
+            if ($pid > 0 && isset($children[$pid])) {
+                unset($children[$pid]);
+                if (!$waitAll) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        } while ($waitAll && !empty($children));
+    }
+
+    protected function init_worker_cursor()
+    {
+        $this->worker_cursor_file = trailingslashit($this->dir) . 'post_cursor.lock';
+        file_put_contents($this->worker_cursor_file, '0');
+    }
+
+    protected function destroy_worker_cursor()
+    {
+        if ($this->worker_cursor_file && file_exists($this->worker_cursor_file)) {
+            @unlink($this->worker_cursor_file);
+        }
+    }
+
+    protected function claim_next_cursor()
+    {
+        if (!$this->worker_cursor_file || $this->total_post_count === 0) {
+            return null;
+        }
+
+        $fp = fopen($this->worker_cursor_file, 'c+');
+        if (!$fp) {
+            return null;
+        }
+
+        if (!flock($fp, LOCK_EX)) {
+            fclose($fp);
+            return null;
+        }
+
+        rewind($fp);
+        $current = (int)trim(stream_get_contents($fp) ?: '0');
+        if ($current >= $this->total_post_count) {
+            flock($fp, LOCK_UN);
+            fclose($fp);
+            return null;
+        }
+
+        $next = $current + $this->worker_batch_size;
+        ftruncate($fp, 0);
+        rewind($fp);
+        fwrite($fp, (string)$next);
+        fflush($fp);
+        flock($fp, LOCK_UN);
+        fclose($fp);
+
+        return $current;
     }
 
     function filesystem_method_filter()
@@ -554,6 +726,21 @@ class Hugo_Export
     public function setTempDir($tempDir)
     {
         $this->_tempDir = $tempDir . (false === strpos($tempDir, DIRECTORY_SEPARATOR) ? DIRECTORY_SEPARATOR : '');
+    }
+
+    /**
+     * Configure how many worker processes should be used when exporting posts.
+     *
+     * @param int $count
+     */
+    public function setWorkerProcesses($count)
+    {
+        $count = (int)$count;
+        if ($count < 1) {
+            $count = 1;
+        }
+
+        $this->worker_processes = min($count, $this->max_worker_processes);
     }
 
     /**
